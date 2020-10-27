@@ -3,9 +3,16 @@ use fuser::{
     Request,
 };
 use libc::ENOENT;
-use std::env;
 use std::ffi::OsStr;
 use std::time::{Duration, UNIX_EPOCH};
+use std::{env, error::Error};
+
+// Kubernetes related imports
+#[allow(unused_imports)]
+use k8s_openapi::api::core::v1::Namespace;
+use kube::Client;
+
+use kube::api::{Api, ListParams, Meta};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -97,11 +104,18 @@ impl Filesystem for HelloFS {
             return;
         }
 
-        let entries = vec![
+        let mut entries = vec![
             (1, FileType::Directory, "."),
             (1, FileType::Directory, ".."),
             (2, FileType::RegularFile, "hello.txt"),
         ];
+
+        let mut inode_idx = entries.len() as u64;
+        let namespaces = get_namespaces_blocking().unwrap();
+        for ns in &namespaces {
+            entries.push((inode_idx, FileType::Directory, ns));
+            inode_idx += 1;
+        }
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             // i + 1 means the index of the next entry
@@ -111,14 +125,40 @@ impl Filesystem for HelloFS {
     }
 }
 
-fn main() {
-    // env_logger::init();
-    let mountpoint = env::args_os().nth(1).unwrap();
-    let mut options = vec![MountOption::RO, MountOption::FSName("hello".to_string())];
-    if let Some(auto_unmount) = env::args_os().nth(2) {
-        if auto_unmount.eq("--auto_unmount") {
-            options.push(MountOption::AutoUnmount);
-        }
+// Returns a list with the names of all namespaces.
+async fn get_namespaces() -> Result<Vec<String>, Box<dyn Error>> {
+    let client = Client::try_default().await?;
+
+    let ns_api: Api<Namespace> = Api::all(client);
+    let lp = ListParams::default();
+    let mut ns_names: Vec<String> = vec![];
+
+    for namespace in ns_api.list(&lp).await? {
+        ns_names.push(String::from(Meta::name(&namespace)));
     }
-    fuser::mount2(HelloFS, mountpoint, &options).unwrap();
+
+    Ok(ns_names)
 }
+
+// Ideally I would like to annotate this function (the called function) and
+// automatically generate the blocking version of it.
+#[tokio::main]
+async fn get_namespaces_blocking() -> Result<Vec<String>, Box<dyn Error>> {
+    get_namespaces().await
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let mountpoint = env::args_os().nth(1).unwrap();
+    let options = vec![
+        MountOption::RO,
+        MountOption::FSName("hello".to_string()),
+        MountOption::AutoUnmount,
+    ];
+
+    fuser::mount2(HelloFS, mountpoint, &options).unwrap();
+
+    Ok(())
+}
+
+// 1. Make this thing async!
+// 2. List namespaces as root level directories.
