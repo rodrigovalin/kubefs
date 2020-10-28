@@ -14,7 +14,7 @@ libc = "0.2.51"
 log = "0.4.6"
 thread-scoped = "1.0.2"
 users = "0.10.0"
-serde = {version = "1.0.102", features = ["std", "derive"], optional = true}
+serde = {version = "1.0.102", features = ["std", "derive"]}
 
 # Inherited from kube
 kube = { version = "0.43.0", default-features = false, features = ["rustls-tls"] }

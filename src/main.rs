@@ -14,6 +14,13 @@ use kube::Client;
 
 use kube::api::{Api, ListParams, Meta};
 
+// Used to Hash namespace/resource into u64
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
 const HELLO_DIR_ATTR: FileAttr = FileAttr {
@@ -56,22 +63,64 @@ const HELLO_TXT_ATTR: FileAttr = FileAttr {
     padding: 0,
 };
 
-struct HelloFS;
+type Inode = u64;
 
-impl Filesystem for HelloFS {
+type DirectoryDescriptor = BTreeMap<String, (Inode, FileKind)>;
+
+#[derive(Serialize, Deserialize, Copy, Clone, PartialEq)]
+enum FileKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Hash)]
+struct KubernetesResource {
+    name: String,
+}
+
+impl KubernetesResource {
+    fn inode(&self) -> u64 {
+        let mut s = DefaultHasher::new();
+        self.hash(&mut s);
+
+        s.finish()
+    }
+}
+
+struct KubeFS;
+
+impl Filesystem for KubeFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if parent == 1 && name.to_str() == Some("hello.txt") {
-            reply.entry(&TTL, &HELLO_TXT_ATTR, 0);
+        // These are file-like objects at the root /
+        println!(
+            "Looking up: {}, with parent {}",
+            name.to_str().unwrap(),
+            parent
+        );
+        if parent == 1 {
+            if name.to_str() == Some("hello.txt") {
+                reply.entry(&TTL, &HELLO_TXT_ATTR, 0);
+            } else {
+                let mut dir_attr = HELLO_DIR_ATTR.clone();
+                let inode = KubernetesResource {
+                    name: String::from(name.to_str().unwrap()),
+                }
+                .inode();
+                dir_attr.ino = inode;
+                reply.entry(&TTL, &dir_attr, 0);
+            }
         } else {
             reply.error(ENOENT);
         }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        println!("getattr {}", ino);
         match ino {
             1 => reply.attr(&TTL, &HELLO_DIR_ATTR),
             2 => reply.attr(&TTL, &HELLO_TXT_ATTR),
-            _ => reply.error(ENOENT),
+            _ => reply.attr(&TTL, &HELLO_DIR_ATTR),
         }
     }
 
@@ -110,11 +159,14 @@ impl Filesystem for HelloFS {
             (2, FileType::RegularFile, "hello.txt"),
         ];
 
-        let mut inode_idx = entries.len() as u64;
         let namespaces = get_namespaces_blocking().unwrap();
         for ns in &namespaces {
-            entries.push((inode_idx, FileType::Directory, ns));
-            inode_idx += 1;
+            let inode = KubernetesResource {
+                name: String::from(ns.clone()),
+            }
+            .inode();
+            entries.push((inode, FileType::Directory, ns));
+            println!("Adding namespace/{} with inode {}", &ns, inode);
         }
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
@@ -155,10 +207,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         MountOption::AutoUnmount,
     ];
 
-    fuser::mount2(HelloFS, mountpoint, &options).unwrap();
+    fuser::mount2(KubeFS, mountpoint, &options).unwrap();
 
     Ok(())
 }
-
-// 1. Make this thing async!
-// 2. List namespaces as root level directories.
