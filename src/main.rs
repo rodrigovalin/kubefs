@@ -9,7 +9,7 @@ use std::{env, error::Error};
 
 // Kubernetes related imports
 #[allow(unused_imports)]
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::{Namespace, Pod};
 use kube::Client;
 
 use kube::api::{Api, ListParams, Meta};
@@ -66,6 +66,7 @@ const HELLO_TXT_ATTR: FileAttr = FileAttr {
 type Inode = u64;
 
 type DirectoryDescriptor = BTreeMap<Inode, KubernetesResource>;
+type NamespaceContents = BTreeMap<Inode, Vec<KubernetesResource>>;
 
 #[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Hash)]
 enum FileKind {
@@ -136,12 +137,20 @@ impl KubernetesResource {
 
 struct KubeFS {
     directory: DirectoryDescriptor,
+    namespace_directory: NamespaceContents,
+    cache: bool,
 }
 
 impl KubeFS {
     fn new() -> Self {
         let mut kf = KubeFS {
+            // `directory` has the top-level directories (namespaces)
             directory: DirectoryDescriptor::new(),
+            // `namespaced_directory` has a series of objects per namespace.
+            namespace_directory: NamespaceContents::new(),
+
+            // always fetch from kube-api
+            cache: false,
         };
         kf.populate_directory_with_namespaces(
             get_namespaces_blocking().expect("Could not read namespaces from Kubernetes"),
@@ -157,28 +166,38 @@ impl KubeFS {
         }
     }
 
+    fn populate_namespaces_directory(&mut self, inode: Inode) {
+        let namespace_name = match self.directory.get(&inode) {
+            Some(namespace) => match &namespace.reference {
+                ResourceScope::Namespaced { name, namespace } => name,
+                ResourceScope::Cluster { name } => name,
+            },
+            None => unimplemented!(),
+        };
+
+        let mut resources = vec![];
+        let pods = get_pods(&namespace_name).expect("Error fetching Pods from kube-api");
+        for pod in pods {
+            resources.push(KubernetesResource {
+                reference: ResourceScope::Namespaced {
+                    name: pod,
+                    namespace: namespace_name.into(),
+                },
+                kind: "Pod".into(),
+                group: "corev1".into(),
+                file_type: FileType::RegularFile,
+            })
+        }
+
+        self.namespace_directory.insert(inode, resources);
+    }
+
     // finds resources that belong to a namespace on the fly.
-    fn find_namespaced_resources(&self, namespace: &str) -> Vec<KubernetesResource> {
-        vec![
-            KubernetesResource {
-                reference: ResourceScope::Namespaced {
-                    name: "pod-1".into(),
-                    namespace: namespace.into(),
-                },
-                kind: "Pod".into(),
-                group: "corev1".into(),
-                file_type: FileType::RegularFile,
-            },
-            KubernetesResource {
-                reference: ResourceScope::Namespaced {
-                    name: "pod-2".into(),
-                    namespace: namespace.into(),
-                },
-                kind: "Pod".into(),
-                group: "corev1".into(),
-                file_type: FileType::RegularFile,
-            },
-        ]
+    fn find_namespaced_resources(&self, inode: Inode) -> Vec<KubernetesResource> {
+        match self.namespace_directory.get(&inode) {
+            Some(directory) => directory.to_vec(),
+            None => vec![],
+        }
     }
 }
 
@@ -192,10 +211,10 @@ impl Filesystem for KubeFS {
         );
 
         println!("Directory has {} entries", self.directory.len());
+        let sname: String = name.to_str().unwrap().into();
         if parent == 1 {
             println!("Traversing namespaces");
 
-            let sname: String = name.to_str().unwrap().into();
             for (_inode, resource) in self.directory.iter() {
                 let name = match &resource.reference {
                     ResourceScope::Namespaced { name, namespace: _ } => name,
@@ -209,13 +228,23 @@ impl Filesystem for KubeFS {
                 }
             }
         } else {
-            if let Some(resource) = self.directory.get(&parent) {
-                println!(
-                    "Looking at the resource {} with parent: {} (named: {})",
-                    resource.inode(),
-                    parent,
-                    resource.name()
-                );
+            if !self.namespace_directory.contains_key(&parent) {
+                self.populate_namespaces_directory(parent);
+            }
+
+            if let Some(resources) = self.namespace_directory.get(&parent) {
+                for resource in resources {
+                    let name = match &resource.reference {
+                        ResourceScope::Namespaced { name, namespace: _ } => name,
+                        ResourceScope::Cluster { name } => name,
+                    };
+                    println!("Checking if {} matches what I'm looking for", &name);
+                    if *name == sname {
+                        println!("{} matches!", name);
+                        reply.entry(&TTL, &resource.file_attr(), 1);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -270,44 +299,25 @@ impl Filesystem for KubeFS {
             }
         } else {
             println!("Checking inode {}", ino);
-            if let Some(resource) = self.directory.get(&ino) {
-                let namespace = match &resource.reference {
-                    ResourceScope::Namespaced { name, namespace: _ } => name,
-                    ResourceScope::Cluster { name } => name,
+            // this should cache the contents for a while, but not yet
+            if !self.cache {
+                self.populate_namespaces_directory(ino);
+            } else {
+                unimplemented!();
+            }
+            let namespaced_resources = self.find_namespaced_resources(ino);
+            for nsr in namespaced_resources {
+                let name: String = match &nsr.reference {
+                    ResourceScope::Namespaced { name, namespace: _ } => name.clone(),
+                    ResourceScope::Cluster { name } => name.clone(),
                 };
-                //let ns = "default".into();
-                let namespaced_resources = self.find_namespaced_resources(&namespace);
-                for nsr in namespaced_resources {
-                    let name: String = match &nsr.reference {
-                        ResourceScope::Namespaced { name, namespace: _ } => name.clone(),
-                        ResourceScope::Cluster { name } => name.clone(),
-                    };
-                    entries.push((nsr.inode(), nsr.file_type, name));
-                }
-                println!("Found resource with inode in directory.");
+                entries.push((nsr.inode(), nsr.file_type, name));
             }
         }
 
         for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             reply.add(entry.0, (idx + 1) as i64, entry.1, &entry.2);
         }
-        //  else {
-        //     let res = KubernetesResource {
-        //         reference: ResourceScope::Namespaced {
-        //             namespace: "default".into(),
-        //             name: "pod-name".into(),
-        //         },
-        //         kind: "Pod".into(),
-        //         group: "corev1".into(),
-        //         file_type: FileType::RegularFile,
-        //     };
-        //     entries.push((res.inode(), FileType::Directory, &res.name()));
-        // }
-
-        // for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-        //     // i + 1 means the index of the next entry
-        //     reply.add(entry.0, (i + 1) as i64, entry.1, entry.2);
-        // }
 
         reply.ok();
     }
@@ -637,6 +647,22 @@ async fn get_namespaces() -> Result<Vec<String>, Box<dyn Error>> {
 #[tokio::main]
 async fn get_namespaces_blocking() -> Result<Vec<String>, Box<dyn Error>> {
     get_namespaces().await
+}
+
+// Returns a list with the names of all namespaces.
+#[tokio::main]
+async fn get_pods(namespace: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let client = Client::try_default().await?;
+
+    let pod_api: Api<Pod> = Api::namespaced(client, namespace);
+    let lp = ListParams::default();
+    let mut pod_names: Vec<String> = vec![];
+
+    for namespace in pod_api.list(&lp).await? {
+        pod_names.push(String::from(Meta::name(&namespace)));
+    }
+
+    Ok(pod_names)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
