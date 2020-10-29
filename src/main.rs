@@ -65,30 +65,122 @@ const HELLO_TXT_ATTR: FileAttr = FileAttr {
 
 type Inode = u64;
 
-type DirectoryDescriptor = BTreeMap<String, (Inode, FileKind)>;
+type DirectoryDescriptor = BTreeMap<Inode, KubernetesResource>;
 
-#[derive(Serialize, Deserialize, Copy, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Hash)]
 enum FileKind {
     File,
     Directory,
     Symlink,
 }
 
-#[derive(Hash)]
+#[derive(Hash, Clone, Debug)]
 struct KubernetesResource {
-    name: String,
+    reference: ResourceScope,
+    kind: String,
+    group: String,
+
+    file_type: FileType,
+}
+
+#[derive(Hash, Clone, Debug)]
+enum ResourceScope {
+    Namespaced { name: String, namespace: String },
+    Cluster { name: String },
 }
 
 impl KubernetesResource {
+    fn new_namespace(name: &str) -> KubernetesResource {
+        KubernetesResource {
+            reference: ResourceScope::Cluster { name: name.into() },
+            kind: "namespace".into(),
+            group: "corev1".into(),
+            file_type: FileType::Directory,
+        }
+    }
     fn inode(&self) -> u64 {
         let mut s = DefaultHasher::new();
         self.hash(&mut s);
 
         s.finish()
     }
+
+    fn name(&self) -> String {
+        match &self.reference {
+            ResourceScope::Namespaced { name, namespace } => format!("{}/{}", namespace, name),
+            ResourceScope::Cluster { name } => name.clone(),
+        }
+    }
+
+    fn file_attr(&self) -> FileAttr {
+        FileAttr {
+            ino: self.inode(),
+            size: 1,
+            blocks: 1,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH, // replace with time of creation of resource?
+            crtime: UNIX_EPOCH,
+            kind: FileType::Directory,
+            perm: 0o774, // rwxrwxr
+            nlink: 1,
+            uid: 501,
+            gid: 20,
+            rdev: 0,
+            flags: 0,
+            blksize: 512,
+            padding: 0,
+        }
+    }
 }
 
-struct KubeFS;
+struct KubeFS {
+    directory: DirectoryDescriptor,
+}
+
+impl KubeFS {
+    fn new() -> Self {
+        let mut kf = KubeFS {
+            directory: DirectoryDescriptor::new(),
+        };
+        kf.populate_directory_with_namespaces(
+            get_namespaces_blocking().expect("Could not read namespaces from Kubernetes"),
+        );
+
+        kf
+    }
+
+    fn populate_directory_with_namespaces(&mut self, namespaces: Vec<String>) {
+        for ns in &namespaces {
+            let k = KubernetesResource::new_namespace(ns);
+            self.directory.insert(k.inode(), k);
+        }
+    }
+
+    // finds resources that belong to a namespace on the fly.
+    fn find_namespaced_resources(&self, namespace: &str) -> Vec<KubernetesResource> {
+        vec![
+            KubernetesResource {
+                reference: ResourceScope::Namespaced {
+                    name: "pod-1".into(),
+                    namespace: namespace.into(),
+                },
+                kind: "Pod".into(),
+                group: "corev1".into(),
+                file_type: FileType::RegularFile,
+            },
+            KubernetesResource {
+                reference: ResourceScope::Namespaced {
+                    name: "pod-2".into(),
+                    namespace: namespace.into(),
+                },
+                kind: "Pod".into(),
+                group: "corev1".into(),
+                file_type: FileType::RegularFile,
+            },
+        ]
+    }
+}
 
 impl Filesystem for KubeFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
@@ -98,20 +190,33 @@ impl Filesystem for KubeFS {
             name.to_str().unwrap(),
             parent
         );
+
+        println!("Directory has {} entries", self.directory.len());
         if parent == 1 {
-            if name.to_str() == Some("hello.txt") {
-                reply.entry(&TTL, &HELLO_TXT_ATTR, 0);
-            } else {
-                let mut dir_attr = HELLO_DIR_ATTR.clone();
-                let inode = KubernetesResource {
-                    name: String::from(name.to_str().unwrap()),
+            println!("Traversing namespaces");
+
+            let sname: String = name.to_str().unwrap().into();
+            for (_inode, resource) in self.directory.iter() {
+                let name = match &resource.reference {
+                    ResourceScope::Namespaced { name, namespace: _ } => name,
+                    ResourceScope::Cluster { name } => name,
+                };
+                println!("Checking if {} matches what I'm looking for", &name);
+                if *name == sname {
+                    println!("{} matches!", name);
+                    reply.entry(&TTL, &resource.file_attr(), 1);
+                    break;
                 }
-                .inode();
-                dir_attr.ino = inode;
-                reply.entry(&TTL, &dir_attr, 0);
             }
         } else {
-            reply.error(ENOENT);
+            if let Some(resource) = self.directory.get(&parent) {
+                println!(
+                    "Looking at the resource {} with parent: {} (named: {})",
+                    resource.inode(),
+                    parent,
+                    resource.name()
+                );
+            }
         }
     }
 
@@ -148,32 +253,367 @@ impl Filesystem for KubeFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        if ino != 1 {
-            reply.error(ENOENT);
-            return;
-        }
-
         let mut entries = vec![
-            (1, FileType::Directory, "."),
-            (1, FileType::Directory, ".."),
-            (2, FileType::RegularFile, "hello.txt"),
+            (ino, FileType::Directory, String::from(".")),
+            (ino, FileType::Directory, String::from("..")),
         ];
 
-        let namespaces = get_namespaces_blocking().unwrap();
-        for ns in &namespaces {
-            let inode = KubernetesResource {
-                name: String::from(ns.clone()),
+        if ino == 1 {
+            // Parent directory (root) only has a bunch of namespaces
+            for (inode, resource) in &self.directory {
+                println!("This is {:?}", resource);
+                let name = match &resource.reference {
+                    ResourceScope::Namespaced { name, namespace: _ } => name,
+                    ResourceScope::Cluster { name } => name,
+                };
+                entries.push((*inode, FileType::Directory, name.into()));
             }
-            .inode();
-            entries.push((inode, FileType::Directory, ns));
-            println!("Adding namespace/{} with inode {}", &ns, inode);
+        } else {
+            println!("Checking inode {}", ino);
+            if let Some(resource) = self.directory.get(&ino) {
+                let namespace = match &resource.reference {
+                    ResourceScope::Namespaced { name, namespace: _ } => name,
+                    ResourceScope::Cluster { name } => name,
+                };
+                //let ns = "default".into();
+                let namespaced_resources = self.find_namespaced_resources(&namespace);
+                for nsr in namespaced_resources {
+                    let name: String = match &nsr.reference {
+                        ResourceScope::Namespaced { name, namespace: _ } => name.clone(),
+                        ResourceScope::Cluster { name } => name.clone(),
+                    };
+                    entries.push((nsr.inode(), nsr.file_type, name));
+                }
+                println!("Found resource with inode in directory.");
+            }
         }
 
-        for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-            // i + 1 means the index of the next entry
-            reply.add(entry.0, (i + 1) as i64, entry.1, entry.2);
+        for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+            reply.add(entry.0, (idx + 1) as i64, entry.1, &entry.2);
         }
+        //  else {
+        //     let res = KubernetesResource {
+        //         reference: ResourceScope::Namespaced {
+        //             namespace: "default".into(),
+        //             name: "pod-name".into(),
+        //         },
+        //         kind: "Pod".into(),
+        //         group: "corev1".into(),
+        //         file_type: FileType::RegularFile,
+        //     };
+        //     entries.push((res.inode(), FileType::Directory, &res.name()));
+        // }
+
+        // for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+        //     // i + 1 means the index of the next entry
+        //     reply.add(entry.0, (i + 1) as i64, entry.1, entry.2);
+        // }
+
         reply.ok();
+    }
+
+    fn init(&mut self, _req: &Request<'_>) -> Result<(), libc::c_int> {
+        Ok(())
+    }
+
+    fn destroy(&mut self, _req: &Request<'_>) {}
+
+    fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
+
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<std::time::SystemTime>,
+        _atime_now: bool,
+        _mtime: Option<std::time::SystemTime>,
+        _mtime_now: bool,
+        _fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyData) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _mode: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _mode: u32,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn unlink(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: fuser::ReplyEmpty) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _link: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _newparent: u64,
+        _newname: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _newparent: u64,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: u32, reply: fuser::ReplyOpen) {
+        reply.opened(0, 0);
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _offset: i64,
+        _data: &[u8],
+        _flags: u32,
+        reply: fuser::ReplyWrite,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: u32,
+        _lock_owner: u64,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: u32, reply: fuser::ReplyOpen) {
+        reply.opened(0, 0);
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: u32,
+        _position: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: fuser::ReplyXattr) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn removexattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _name: &OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: u32, reply: fuser::ReplyEmpty) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _mode: u32,
+        _flags: u32,
+        reply: fuser::ReplyCreate,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn getlk(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: u32,
+        _pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn setlk(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: u32,
+        _pid: u32,
+        _sleep: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn bmap(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _blocksize: u32,
+        _idx: u64,
+        reply: fuser::ReplyBmap,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn setvolname(&mut self, _req: &Request<'_>, _name: &OsStr, reply: fuser::ReplyEmpty) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn exchange(
+        &mut self,
+        _req: &Request<'_>,
+        _parent: u64,
+        _name: &OsStr,
+        _newparent: u64,
+        _newname: &OsStr,
+        _options: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(libc::ENOSYS);
+    }
+
+    fn getxtimes(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyXTimes) {
+        reply.error(libc::ENOSYS);
     }
 }
 
@@ -207,7 +647,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         MountOption::AutoUnmount,
     ];
 
-    fuser::mount2(KubeFS, mountpoint, &options).unwrap();
+    fuser::mount2(KubeFS::new(), mountpoint, &options).unwrap();
 
     Ok(())
 }
+
+// Each file-like object needs to be:
+//
+// 1. If it is a directory, readdir should returns its contents. It is indexed by inode.
+//    This will happen everytime we list a directory. This can be the root (inode == 1) or
+//    a namespace, with an 'unknown' inode.
+//
+// 2. We'll call lookup on each file-like object, and it needs to return a list of files on it.
+//    File is requested by name, being part of parent, which is an inode'd directory. This means that
+//    we need a way of storing the
