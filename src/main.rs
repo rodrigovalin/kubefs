@@ -609,10 +609,12 @@ impl Filesystem for KubeFS {
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn setvolname(&mut self, _req: &Request<'_>, _name: &OsStr, reply: fuser::ReplyEmpty) {
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn exchange(
         &mut self,
         _req: &Request<'_>,
@@ -626,6 +628,7 @@ impl Filesystem for KubeFS {
         reply.error(libc::ENOSYS);
     }
 
+    #[cfg(target_os = "macos")]
     fn getxtimes(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyXTimes) {
         reply.error(libc::ENOSYS);
     }
