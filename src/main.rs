@@ -106,6 +106,10 @@ impl KubernetesResource {
         s.finish()
     }
 
+    // Fighting with the borrow checker. It seems that I can't use this string anywhere
+    // if I need a reference to it. That's why i'm repeating these same steps to get the
+    // name from multiple places.
+    #[allow(dead_code)]
     fn name(&self) -> String {
         match &self.reference {
             ResourceScope::Namespaced { name, namespace } => format!("{}/{}", namespace, name),
@@ -122,7 +126,7 @@ impl KubernetesResource {
             mtime: UNIX_EPOCH,
             ctime: UNIX_EPOCH, // replace with time of creation of resource?
             crtime: UNIX_EPOCH,
-            kind: FileType::Directory,
+            kind: self.file_type,
             perm: 0o774, // rwxrwxr
             nlink: 1,
             uid: 501,
@@ -169,7 +173,7 @@ impl KubeFS {
     fn populate_namespaces_directory(&mut self, inode: Inode) {
         let namespace_name = match self.directory.get(&inode) {
             Some(namespace) => match &namespace.reference {
-                ResourceScope::Namespaced { name, namespace } => name,
+                ResourceScope::Namespaced { name, namespace: _ } => name,
                 ResourceScope::Cluster { name } => name,
             },
             None => unimplemented!(),
@@ -212,6 +216,8 @@ impl Filesystem for KubeFS {
 
         println!("Directory has {} entries", self.directory.len());
         let sname: String = name.to_str().unwrap().into();
+
+        // TODO: move whatever is repeated in these 2 if arms
         if parent == 1 {
             println!("Traversing namespaces");
 
@@ -220,7 +226,6 @@ impl Filesystem for KubeFS {
                     ResourceScope::Namespaced { name, namespace: _ } => name,
                     ResourceScope::Cluster { name } => name,
                 };
-                println!("Checking if {} matches what I'm looking for", &name);
                 if *name == sname {
                     println!("{} matches!", name);
                     reply.entry(&TTL, &resource.file_attr(), 1);
@@ -250,7 +255,6 @@ impl Filesystem for KubeFS {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        println!("getattr {}", ino);
         match ino {
             1 => reply.attr(&TTL, &HELLO_DIR_ATTR),
             2 => reply.attr(&TTL, &HELLO_TXT_ATTR),
