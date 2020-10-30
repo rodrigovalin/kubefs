@@ -16,57 +16,16 @@ use kube::api::{Api, ListParams, Meta};
 
 // Used to Hash namespace/resource into u64
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
-const HELLO_DIR_ATTR: FileAttr = FileAttr {
-    ino: 1,
-    size: 0,
-    blocks: 0,
-    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::Directory,
-    perm: 0o755,
-    nlink: 2,
-    uid: 501,
-    gid: 20,
-    rdev: 0,
-    flags: 0,
-    blksize: 512,
-    padding: 0,
-};
-
-const HELLO_TXT_CONTENT: &str = "Hello World!\n";
-
-const HELLO_TXT_ATTR: FileAttr = FileAttr {
-    ino: 2,
-    size: 13,
-    blocks: 1,
-    atime: UNIX_EPOCH, // 1970-01-01 00:00:00
-    mtime: UNIX_EPOCH,
-    ctime: UNIX_EPOCH,
-    crtime: UNIX_EPOCH,
-    kind: FileType::RegularFile,
-    perm: 0o644,
-    nlink: 1,
-    uid: 501,
-    gid: 20,
-    rdev: 0,
-    flags: 0,
-    blksize: 512,
-    padding: 0,
-};
-
 type Inode = u64;
 
-type DirectoryDescriptor = BTreeMap<Inode, KubernetesResource>;
-type NamespaceContents = BTreeMap<Inode, Vec<KubernetesResource>>;
+type KubernetesFilesystem = BTreeMap<Inode, KubernetesResource>;
 
 #[derive(Serialize, Deserialize, Copy, Clone, PartialEq, Hash)]
 enum FileKind {
@@ -75,46 +34,41 @@ enum FileKind {
     Symlink,
 }
 
-#[derive(Hash, Clone, Debug)]
+#[derive(Hash, Clone, Debug, PartialEq)]
 struct KubernetesResource {
-    reference: ResourceScope,
-    kind: String,
-    group: String,
+    // Name of the resource
+    name: String,
 
+    // If this resource contains others (for now this is a Namespace/directory)
+    subresources: Option<Vec<Inode>>,
+
+    // file_type will depend on the value of subresource (some or none), but for
+    // now we'll keep it.
     file_type: FileType,
-}
-
-#[derive(Hash, Clone, Debug)]
-enum ResourceScope {
-    Namespaced { name: String, namespace: String },
-    Cluster { name: String },
 }
 
 impl KubernetesResource {
     fn new_namespace(name: &str) -> KubernetesResource {
         KubernetesResource {
-            reference: ResourceScope::Cluster { name: name.into() },
-            kind: "namespace".into(),
-            group: "corev1".into(),
+            name: name.into(),
+            subresources: None,
             file_type: FileType::Directory,
         }
     }
+
+    fn new_pod(name: &str) -> KubernetesResource {
+        KubernetesResource {
+            name: name.into(),
+            subresources: None,
+            file_type: FileType::RegularFile,
+        }
+    }
+
     fn inode(&self) -> u64 {
         let mut s = DefaultHasher::new();
         self.hash(&mut s);
 
         s.finish()
-    }
-
-    // Fighting with the borrow checker. It seems that I can't use this string anywhere
-    // if I need a reference to it. That's why i'm repeating these same steps to get the
-    // name from multiple places.
-    #[allow(dead_code)]
-    fn name(&self) -> String {
-        match &self.reference {
-            ResourceScope::Namespaced { name, namespace } => format!("{}/{}", namespace, name),
-            ResourceScope::Cluster { name } => name.clone(),
-        }
     }
 
     fn file_attr(&self) -> FileAttr {
@@ -140,73 +94,68 @@ impl KubernetesResource {
 }
 
 struct KubeFS {
-    directory: DirectoryDescriptor,
-    namespace_directory: NamespaceContents,
-    cache: bool,
+    filesystem: KubernetesFilesystem,
+    // TODO: add some kind of cache.. or is TTL going to be enough?
+    // cache: bool,
 }
 
 impl KubeFS {
     fn new() -> Self {
         let mut kf = KubeFS {
             // `directory` has the top-level directories (namespaces)
-            directory: DirectoryDescriptor::new(),
-            // `namespaced_directory` has a series of objects per namespace.
-            namespace_directory: NamespaceContents::new(),
-
+            filesystem: BTreeMap::new(),
             // always fetch from kube-api
-            cache: false,
+            // cache: false,
         };
-        kf.populate_directory_with_namespaces(
-            get_namespaces_blocking().expect("Could not read namespaces from Kubernetes"),
-        );
 
+        kf.populate_root_filesystem();
         kf
     }
 
-    fn populate_directory_with_namespaces(&mut self, namespaces: Vec<String>) {
-        for ns in &namespaces {
-            let k = KubernetesResource::new_namespace(ns);
-            self.directory.insert(k.inode(), k);
+    fn populate_namespace_filesystem(&mut self, namespace_inode: Inode) {
+        let mut namespace_resource = self.filesystem.get(&namespace_inode).unwrap().clone();
+
+        // we'll remove the current object
+        self.filesystem.remove(&namespace_inode).unwrap();
+
+        // For now we only have Pods
+        let pods = get_pods(&namespace_resource.name).expect("Could nto read pods from cluster");
+        let mut subresources = vec![];
+        for pod in pods {
+            let kr = KubernetesResource::new_pod(&pod);
+            let inode = kr.inode();
+            self.filesystem.insert(inode, kr);
+            subresources.push(inode);
         }
+
+        namespace_resource.subresources = Some(subresources);
+        self.filesystem.insert(namespace_inode, namespace_resource);
     }
 
-    fn populate_namespaces_directory(&mut self, inode: Inode) {
-        let namespace_name = match self.directory.get(&inode) {
-            Some(namespace) => match &namespace.reference {
-                ResourceScope::Namespaced { name, namespace: _ } => name,
-                ResourceScope::Cluster { name } => name,
-            },
-            None => unimplemented!(),
+    fn populate_root_filesystem(&mut self) {
+        let namespaces = get_namespaces().expect("Could not read namespaces from cluster");
+        let mut subresources = vec![];
+        for namespace in namespaces {
+            // Adds all the directories
+            let kr = KubernetesResource::new_namespace(&namespace);
+            let inode = kr.inode();
+            self.filesystem.insert(inode, kr);
+            subresources.push(inode);
+        }
+
+        let root = KubernetesResource {
+            name: "/".into(),
+            subresources: Some(subresources),
+            file_type: FileType::Directory,
         };
 
-        let mut resources = vec![];
-        let pods = get_pods(&namespace_name).expect("Error fetching Pods from kube-api");
-        for pod in pods {
-            resources.push(KubernetesResource {
-                reference: ResourceScope::Namespaced {
-                    name: pod,
-                    namespace: namespace_name.into(),
-                },
-                kind: "Pod".into(),
-                group: "corev1".into(),
-                file_type: FileType::RegularFile,
-            })
-        }
-
-        self.namespace_directory.insert(inode, resources);
-    }
-
-    // finds resources that belong to a namespace on the fly.
-    fn find_namespaced_resources(&self, inode: Inode) -> Vec<KubernetesResource> {
-        match self.namespace_directory.get(&inode) {
-            Some(directory) => directory.to_vec(),
-            None => vec![],
-        }
+        self.filesystem.insert(1u64, root);
     }
 }
 
 impl Filesystem for KubeFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        println!("lookup");
         // These are file-like objects at the root /
         println!(
             "Looking up: {}, with parent {}",
@@ -214,38 +163,17 @@ impl Filesystem for KubeFS {
             parent
         );
 
-        println!("Directory has {} entries", self.directory.len());
+        // TODO: We need to find the node that corresponds to 'parent'. This one is easy, it requieres
+        // self.filesystem[parent] and look at every children in this node.
+
+        // println!("Directory has {} entries", self.directory.len());
         let sname: String = name.to_str().unwrap().into();
 
-        // TODO: move whatever is repeated in these 2 if arms
-        if parent == 1 {
-            println!("Traversing namespaces");
-
-            for (_inode, resource) in self.directory.iter() {
-                let name = match &resource.reference {
-                    ResourceScope::Namespaced { name, namespace: _ } => name,
-                    ResourceScope::Cluster { name } => name,
-                };
-                if *name == sname {
-                    println!("{} matches!", name);
-                    reply.entry(&TTL, &resource.file_attr(), 1);
-                    break;
-                }
-            }
-        } else {
-            if !self.namespace_directory.contains_key(&parent) {
-                self.populate_namespaces_directory(parent);
-            }
-
-            if let Some(resources) = self.namespace_directory.get(&parent) {
-                for resource in resources {
-                    let name = match &resource.reference {
-                        ResourceScope::Namespaced { name, namespace: _ } => name,
-                        ResourceScope::Cluster { name } => name,
-                    };
-                    println!("Checking if {} matches what I'm looking for", &name);
-                    if *name == sname {
-                        println!("{} matches!", name);
+        if let Some(directory) = self.filesystem.get(&parent) {
+            let subresources = directory.subresources.clone().unwrap();
+            for resource_inode in &subresources {
+                if let Some(resource) = self.filesystem.get(resource_inode) {
+                    if resource.name == sname {
                         reply.entry(&TTL, &resource.file_attr(), 1);
                         break;
                     }
@@ -255,10 +183,13 @@ impl Filesystem for KubeFS {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        match ino {
-            1 => reply.attr(&TTL, &HELLO_DIR_ATTR),
-            2 => reply.attr(&TTL, &HELLO_TXT_ATTR),
-            _ => reply.attr(&TTL, &HELLO_DIR_ATTR),
+        println!("getattr for inode {}", ino);
+        match self.filesystem.get(&ino) {
+            Some(resource) => {
+                println!("Found resource {}", resource.name);
+                reply.attr(&TTL, &resource.file_attr())
+            }
+            None => {}
         }
     }
 
@@ -271,11 +202,13 @@ impl Filesystem for KubeFS {
         _size: u32,
         reply: ReplyData,
     ) {
-        if ino == 2 {
-            reply.data(&HELLO_TXT_CONTENT.as_bytes()[offset as usize..]);
-        } else {
-            reply.error(ENOENT);
-        }
+        println!("read for inode {} (offset {})", ino, offset);
+        // if ino == 2 {
+        //     reply.data(&HELLO_TXT_CONTENT.as_bytes()[offset as usize..]);
+        // } else {
+        //     reply.error(ENOENT);
+        // }
+        reply.data(&"Hello World!\n".as_bytes()[offset as usize..]);
     }
 
     fn readdir(
@@ -286,37 +219,31 @@ impl Filesystem for KubeFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        println!("readdir");
         let mut entries = vec![
             (ino, FileType::Directory, String::from(".")),
             (ino, FileType::Directory, String::from("..")),
         ];
 
-        if ino == 1 {
-            // Parent directory (root) only has a bunch of namespaces
-            for (inode, resource) in &self.directory {
-                println!("This is {:?}", resource);
-                let name = match &resource.reference {
-                    ResourceScope::Namespaced { name, namespace: _ } => name,
-                    ResourceScope::Cluster { name } => name,
-                };
-                entries.push((*inode, FileType::Directory, name.into()));
+        if ino != 1 {
+            // not needed if root directory
+            self.populate_namespace_filesystem(ino);
+        }
+        if let Some(directory) = self.filesystem.get(&ino) {
+            let subresources = directory.subresources.clone().unwrap();
+            for resource_inode in &subresources {
+                if let Some(resource) = self.filesystem.get(resource_inode) {
+                    entries.push((*resource_inode, resource.file_type, resource.name.clone()));
+                } else {
+                    println!(
+                        "Could not find resource with inode {} in filesystem",
+                        resource_inode
+                    );
+                }
             }
         } else {
-            println!("Checking inode {}", ino);
-            // this should cache the contents for a while, but not yet
-            if !self.cache {
-                self.populate_namespaces_directory(ino);
-            } else {
-                unimplemented!();
-            }
-            let namespaced_resources = self.find_namespaced_resources(ino);
-            for nsr in namespaced_resources {
-                let name: String = match &nsr.reference {
-                    ResourceScope::Namespaced { name, namespace: _ } => name.clone(),
-                    ResourceScope::Cluster { name } => name.clone(),
-                };
-                entries.push((nsr.inode(), nsr.file_type, name));
-            }
+            reply.error(ENOENT);
+            return;
         }
 
         for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
@@ -327,12 +254,17 @@ impl Filesystem for KubeFS {
     }
 
     fn init(&mut self, _req: &Request<'_>) -> Result<(), libc::c_int> {
+        println!("init");
         Ok(())
     }
 
-    fn destroy(&mut self, _req: &Request<'_>) {}
+    fn destroy(&mut self, _req: &Request<'_>) {
+        println!("destroy");
+    }
 
-    fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
+    fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {
+        println!("forget");
+    }
 
     fn setattr(
         &mut self,
@@ -353,10 +285,12 @@ impl Filesystem for KubeFS {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        println!("setattr");
         reply.error(libc::ENOSYS);
     }
 
     fn readlink(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyData) {
+        println!("readlink");
         reply.error(libc::ENOSYS);
     }
 
@@ -369,6 +303,7 @@ impl Filesystem for KubeFS {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        println!("mknod");
         reply.error(libc::ENOSYS);
     }
 
@@ -380,6 +315,7 @@ impl Filesystem for KubeFS {
         _mode: u32,
         reply: ReplyEntry,
     ) {
+        println!("mkdir");
         reply.error(libc::ENOSYS);
     }
 
@@ -390,10 +326,12 @@ impl Filesystem for KubeFS {
         _name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("unlink");
         reply.error(libc::ENOSYS);
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: fuser::ReplyEmpty) {
+        println!("rmdir");
         reply.error(libc::ENOSYS);
     }
 
@@ -405,6 +343,7 @@ impl Filesystem for KubeFS {
         _link: &std::path::Path,
         reply: ReplyEntry,
     ) {
+        println!("symlink");
         reply.error(libc::ENOSYS);
     }
 
@@ -417,6 +356,7 @@ impl Filesystem for KubeFS {
         _newname: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("rename");
         reply.error(libc::ENOSYS);
     }
 
@@ -428,10 +368,12 @@ impl Filesystem for KubeFS {
         _newname: &OsStr,
         reply: ReplyEntry,
     ) {
+        println!("link");
         reply.error(libc::ENOSYS);
     }
 
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: u32, reply: fuser::ReplyOpen) {
+        println!("open");
         reply.opened(0, 0);
     }
 
@@ -445,6 +387,7 @@ impl Filesystem for KubeFS {
         _flags: u32,
         reply: fuser::ReplyWrite,
     ) {
+        println!("write");
         reply.error(libc::ENOSYS);
     }
 
@@ -456,6 +399,7 @@ impl Filesystem for KubeFS {
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("flush");
         reply.error(libc::ENOSYS);
     }
 
@@ -469,6 +413,7 @@ impl Filesystem for KubeFS {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("release");
         reply.ok();
     }
 
@@ -480,10 +425,12 @@ impl Filesystem for KubeFS {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("fsync");
         reply.error(libc::ENOSYS);
     }
 
     fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: u32, reply: fuser::ReplyOpen) {
+        println!("opendir");
         reply.opened(0, 0);
     }
 
@@ -495,6 +442,7 @@ impl Filesystem for KubeFS {
         _flags: u32,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("releasedir");
         reply.ok();
     }
 
@@ -506,11 +454,13 @@ impl Filesystem for KubeFS {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("fsyncdir");
         reply.error(libc::ENOSYS);
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+        println!("statfs");
+        reply.statfs(0, 0, 0, 0, 0, 512, 255, 512);
     }
 
     fn setxattr(
@@ -523,6 +473,7 @@ impl Filesystem for KubeFS {
         _position: u32,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("setxattr");
         reply.error(libc::ENOSYS);
     }
 
@@ -534,10 +485,12 @@ impl Filesystem for KubeFS {
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        println!("getxattr");
         reply.error(libc::ENOSYS);
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: fuser::ReplyXattr) {
+        println!("listxattr");
         reply.error(libc::ENOSYS);
     }
 
@@ -548,10 +501,12 @@ impl Filesystem for KubeFS {
         _name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("removexattr");
         reply.error(libc::ENOSYS);
     }
 
     fn access(&mut self, _req: &Request<'_>, _ino: u64, _mask: u32, reply: fuser::ReplyEmpty) {
+        println!("access");
         reply.error(libc::ENOSYS);
     }
 
@@ -564,6 +519,7 @@ impl Filesystem for KubeFS {
         _flags: u32,
         reply: fuser::ReplyCreate,
     ) {
+        println!("create");
         reply.error(libc::ENOSYS);
     }
 
@@ -579,6 +535,7 @@ impl Filesystem for KubeFS {
         _pid: u32,
         reply: fuser::ReplyLock,
     ) {
+        println!("getlk");
         reply.error(libc::ENOSYS);
     }
 
@@ -595,6 +552,7 @@ impl Filesystem for KubeFS {
         _sleep: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("setlk");
         reply.error(libc::ENOSYS);
     }
 
@@ -606,11 +564,13 @@ impl Filesystem for KubeFS {
         _idx: u64,
         reply: fuser::ReplyBmap,
     ) {
+        println!("bmap");
         reply.error(libc::ENOSYS);
     }
 
     #[cfg(target_os = "macos")]
     fn setvolname(&mut self, _req: &Request<'_>, _name: &OsStr, reply: fuser::ReplyEmpty) {
+        println!("setvolname");
         reply.error(libc::ENOSYS);
     }
 
@@ -625,16 +585,19 @@ impl Filesystem for KubeFS {
         _options: u64,
         reply: fuser::ReplyEmpty,
     ) {
+        println!("exchange");
         reply.error(libc::ENOSYS);
     }
 
     #[cfg(target_os = "macos")]
     fn getxtimes(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyXTimes) {
+        println!("getxtimes");
         reply.error(libc::ENOSYS);
     }
 }
 
 // Returns a list with the names of all namespaces.
+#[tokio::main]
 async fn get_namespaces() -> Result<Vec<String>, Box<dyn Error>> {
     let client = Client::try_default().await?;
 
@@ -647,13 +610,6 @@ async fn get_namespaces() -> Result<Vec<String>, Box<dyn Error>> {
     }
 
     Ok(ns_names)
-}
-
-// Ideally I would like to annotate this function (the called function) and
-// automatically generate the blocking version of it.
-#[tokio::main]
-async fn get_namespaces_blocking() -> Result<Vec<String>, Box<dyn Error>> {
-    get_namespaces().await
 }
 
 // Returns a list with the names of all namespaces.
@@ -684,13 +640,3 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
-
-// Each file-like object needs to be:
-//
-// 1. If it is a directory, readdir should returns its contents. It is indexed by inode.
-//    This will happen everytime we list a directory. This can be the root (inode == 1) or
-//    a namespace, with an 'unknown' inode.
-//
-// 2. We'll call lookup on each file-like object, and it needs to return a list of files on it.
-//    File is requested by name, being part of parent, which is an inode'd directory. This means that
-//    we need a way of storing the
