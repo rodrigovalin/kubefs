@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
+use serde_yaml;
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -45,6 +46,8 @@ struct KubernetesResource {
     // file_type will depend on the value of subresource (some or none), but for
     // now we'll keep it.
     file_type: FileType,
+
+    raw_definition: Option<String>,
 }
 
 impl KubernetesResource {
@@ -53,14 +56,21 @@ impl KubernetesResource {
             name: name.into(),
             subresources: None,
             file_type: FileType::Directory,
+
+            raw_definition: None,
         }
     }
 
-    fn new_pod(name: &str) -> KubernetesResource {
+    fn new_pod(pod: k8s_openapi::api::core::v1::Pod) -> KubernetesResource {
+        // Serialize spec into yaml
+        // serde_yaml::to_string(&fdef).unwrap();
         KubernetesResource {
-            name: name.into(),
+            name: pod.name(),
             subresources: None,
             file_type: FileType::RegularFile,
+
+            // `ok` transforms a `Result` into an `Option`
+            raw_definition: serde_yaml::to_string(&pod).ok(),
         }
     }
 
@@ -72,9 +82,13 @@ impl KubernetesResource {
     }
 
     fn file_attr(&self) -> FileAttr {
+        let size = match &self.raw_definition {
+            Some(data) => data.len(),
+            None => 0,
+        };
         FileAttr {
             ino: self.inode(),
-            size: 1,
+            size: size as u64,
             blocks: 1,
             atime: UNIX_EPOCH,
             mtime: UNIX_EPOCH,
@@ -122,7 +136,7 @@ impl KubeFS {
         let pods = get_pods(&namespace_resource.name).expect("Could nto read pods from cluster");
         let mut subresources = vec![];
         for pod in pods {
-            let kr = KubernetesResource::new_pod(&pod);
+            let kr = KubernetesResource::new_pod(pod);
             let inode = kr.inode();
             self.filesystem.insert(inode, kr);
             subresources.push(inode);
@@ -147,6 +161,8 @@ impl KubeFS {
             name: "/".into(),
             subresources: Some(subresources),
             file_type: FileType::Directory,
+
+            raw_definition: None,
         };
 
         self.filesystem.insert(1u64, root);
@@ -203,12 +219,11 @@ impl Filesystem for KubeFS {
         reply: ReplyData,
     ) {
         println!("read for inode {} (offset {})", ino, offset);
-        // if ino == 2 {
-        //     reply.data(&HELLO_TXT_CONTENT.as_bytes()[offset as usize..]);
-        // } else {
-        //     reply.error(ENOENT);
-        // }
-        reply.data(&"Hello World!\n".as_bytes()[offset as usize..]);
+        if let Some(result) = self.filesystem.get(&ino) {
+            println!("Should have got something");
+            let definition = result.raw_definition.clone().unwrap();
+            reply.data(&definition.as_bytes()[offset as usize..]);
+        }
     }
 
     fn readdir(
@@ -614,18 +629,13 @@ async fn get_namespaces() -> Result<Vec<String>, Box<dyn Error>> {
 
 // Returns a list with the names of all namespaces.
 #[tokio::main]
-async fn get_pods(namespace: &str) -> Result<Vec<String>, Box<dyn Error>> {
+async fn get_pods(namespace: &str) -> Result<kube::api::ObjectList<Pod>, Box<dyn Error>> {
     let client = Client::try_default().await?;
 
     let pod_api: Api<Pod> = Api::namespaced(client, namespace);
     let lp = ListParams::default();
-    let mut pod_names: Vec<String> = vec![];
 
-    for namespace in pod_api.list(&lp).await? {
-        pod_names.push(String::from(Meta::name(&namespace)));
-    }
-
-    Ok(pod_names)
+    Ok(pod_api.list(&lp).await?)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
